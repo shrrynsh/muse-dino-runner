@@ -1,21 +1,17 @@
 """
 DINO RUNNER — the Chrome dinosaur game, controlled by BLINKING
 ==============================================================
-Blink = jump. Everything else (jaw clenches, eyebrow raises, head movement)
-is ignored, because every candidate is checked two ways before it counts:
-
-  1. WHERE  — only a forehead sensor (AF7/AF8), right above the eyes, and only
-              a spike in the same direction as your calibration blinks.
-              (Jaw clenches show up behind the ears, so they never get this far.)
-  2. SHAPE  — the spike must match the shape of YOUR blink (template matching).
-              Eyebrow raises are slower and look different.
+Blink = jump, instantly. Jaw clenches, eyebrow raises and head movement are
+ignored because the game only listens to one forehead sensor (AF7/AF8), right
+above the eyes, and only to spikes in the same direction as your calibration
+blinks. Jaw clenches show up behind the ears, so they never reach it.
 
   1. Run `muselsl stream` in a terminal first.
   2. Run this script.
   3. Calibration:
        a. Relax for a few seconds (baseline noise)
        b. Blink 6 times, whenever you like — each one is detected live
-     The script learns your blink's size, direction and shape.
+     The script learns your blink's size and direction.
   4. Play. Blink to jump over cactuses.
      Watch out for HIGH birds — don't blink, run under them!
 
@@ -45,10 +41,6 @@ SRATE           = 256
 BLINK_BAND      = (1.0, 8.0)          # Hz — blinks live here; drift, muscle noise and mains hum don't
 ACT_WIN         = int(0.15 * SRATE)   # calibration activity = peak-to-peak over 150 ms
 
-# Blink check (see docstring)
-SHAPE_PRE       = int(0.25 * SRATE)   # blink shape window: this long before the peak...
-SHAPE_POST      = int(0.15 * SRATE)   # ...and this long after (so a jump comes ~0.2 s after a blink)
-SHAPE_MIN_CORR  = 0.7                 # how closely a spike must match your blink's shape (1 = identical)
 MIN_TRIGGER_X   = 5.0                 # never trigger on spikes smaller than this many times still-noise
 
 # Calibration parameters
@@ -67,9 +59,9 @@ FPS             = 60
 GROUND_Y        = HEIGHT - 70
 GRAVITY         = 0.8
 JUMP_VEL        = -15.5
-START_SPEED     = 4.8                 # a little slower than Chrome's: the blink check adds ~0.2 s
-MAX_SPEED       = 10.5
-SPEED_UP        = 0.0010              # added to speed every frame
+START_SPEED     = 5.5
+MAX_SPEED       = 12.0
+SPEED_UP        = 0.0012              # added to speed every frame
 DINO_X          = 90
 BIRDS_AFTER     = 250                 # score at which birds start appearing
 
@@ -92,8 +84,6 @@ jump_event = threading.Event()
 detect_config = {
     "model":        None,   # blink model from compute_calibration()
     "live":         0.0,    # current blink-direction signal on the forehead sensor (for HUD)
-    "ignored_at":   0.0,    # when a spike was last rejected as "not a blink" (for HUD)
-    "ignored_why":  "",
 }
 detect_lock = threading.Lock()
 stop_eeg    = threading.Event()
@@ -133,50 +123,23 @@ def window_activity(sig):
 
 class BlinkDetector:
     """
-    Fed one filtered sample at a time. When the forehead signal spikes past the
-    trigger in the blink direction, it waits for the spike to peak, then checks
-    its SHAPE. Returns "blink", a reason string if rejected, or None.
+    Fed one filtered sample at a time. Fires the moment the forehead signal
+    crosses the trigger in the blink direction — no waiting for the blink to end.
+    One blink = one jump: it re-arms once the signal settles back down.
     """
     def __init__(self, model):
         self.m = model
-        self.win = SHAPE_PRE + SHAPE_POST
-        self.blink = np.zeros(self.win)       # rolling, oldest first
-        self.n = 0
-        self.peak = None          # biggest value of the spike being tracked
-        self.since_peak = 0
-        self.armed = True         # wait for the signal to settle between spikes
+        self.armed = True
 
     def push(self, row):
-        m = self.m
-        v = m["sign"] * row[m["idx"]]
-        self.blink = np.roll(self.blink, -1)
-        self.blink[-1] = v
-        self.n += 1
-
-        if not self.armed:
-            if v < 0.5 * m["amp_thr"]:
-                self.armed = True
-            return None
-        if self.peak is None:
-            if v > m["amp_thr"]:
-                self.peak, self.since_peak = v, 0
-            return None
-        if v > self.peak:
-            self.peak, self.since_peak = v, 0
-            return None
-        self.since_peak += 1
-        if self.since_peak < SHAPE_POST:
-            return None
-
-        # The spike peaked SHAPE_POST samples ago — the window is centred on it. Check it.
-        self.peak, self.armed = None, False
-        if self.n < self.win:
-            return None
-        z = (self.blink - self.blink.mean()) / (self.blink.std() + 1e-9)
-        corr = float(np.dot(z, m["template"]) / self.win)
-        if corr < SHAPE_MIN_CORR:
-            return f"wrong shape ({corr:.2f})"
-        return "blink"
+        """Returns True on the sample where a blink is detected."""
+        v = self.m["sign"] * row[self.m["idx"]]
+        if self.armed and v > self.m["amp_thr"]:
+            self.armed = False
+            return True
+        if not self.armed and v < 0.5 * self.m["amp_thr"]:
+            self.armed = True
+        return False
 
 
 def eeg_detect_thread(inlet):
@@ -185,23 +148,17 @@ def eeg_detect_thread(inlet):
     det  = BlinkDetector(model)
     filt = EEGFilter()
 
-    print(f"[EEG] Live detection on {model['name']}: trigger {model['amp_thr']:.0f}, "
-          f"shape >= {SHAPE_MIN_CORR}")
+    print(f"[EEG] Live detection on {model['name']}: trigger {model['amp_thr']:.0f}")
 
     while not stop_eeg.is_set():
         raw, _ = inlet.pull_sample(timeout=0.5)
         if raw is None:
             continue
         row = filt([raw])[0]
-        result = det.push(row)
         with detect_lock:
             detect_config["live"] = max(0.0, model["sign"] * row[model["idx"]])
-            if result and result != "blink":
-                detect_config["ignored_at"], detect_config["ignored_why"] = time.time(), result
-        if result == "blink":
+        if det.push(row):
             jump_event.set()
-        elif result:
-            print(f"[EEG] ignored: {result}")
 
 
 # ─── CALIBRATION HELPERS ────────────────────────────────────────────────────
@@ -242,7 +199,6 @@ def compute_calibration(baseline_arr, move_epochs):
     Learn the user's blink from the relaxed baseline + calibration blinks (all filtered [N, 4]):
       - which forehead sensor sees it best, and which direction it spikes
       - trigger level: THRESH_POS of the way from still-noise to the weakest blink
-      - shape template: the average blink, centred on its peak
 
     Returns a model dict, or None if no usable blink was found.
     """
@@ -260,21 +216,6 @@ def compute_calibration(baseline_arr, move_epochs):
             amp_thr = max(noise + THRESH_POS * (weakest - noise), MIN_TRIGGER_X * noise)
             model = dict(idx=idx, name=name, sign=sign, noise=noise, snr=snr,
                          amp_thr=min(amp_thr, 0.8 * weakest))
-    if model is None:
-        return None
-
-    idx, sign = model["idx"], model["sign"]
-    shapes = []
-    for ep in move_epochs:
-        s = sign * ep[:, idx]
-        p = int(np.argmax(s))
-        if p - SHAPE_PRE < 0 or p + SHAPE_POST > len(s):
-            continue
-        w = s[p - SHAPE_PRE:p + SHAPE_POST]
-        shapes.append((w - w.mean()) / (w.std() + 1e-9))
-    if not shapes:
-        return None
-    model["template"] = np.mean(shapes, axis=0)
     return model
 
 
@@ -445,7 +386,6 @@ def draw_hud_play(surf, fonts, score, high):
     with detect_lock:
         model = detect_config["model"]
         val   = detect_config["live"]
-        ignored_at, why = detect_config["ignored_at"], detect_config["ignored_why"]
     if model is None:
         surf.blit(fonts['tiny'].render("KEYBOARD MODE", True, INK_LIGHT), (12, 10))
         return
@@ -457,9 +397,6 @@ def draw_hud_play(surf, fonts, score, high):
     pygame.draw.rect(surf, (230, 230, 230), (x, 28, 26, bar_max))
     pygame.draw.rect(surf, col, (x, 28 + bar_max - bar_h, 26, bar_h))
     pygame.draw.line(surf, UI_AMBER, (x - 2, 28 + bar_max // 2), (x + 28, 28 + bar_max // 2), 2)
-    # Show when a spike was ignored, so the player can see the filter at work
-    if time.time() - ignored_at < 1.2:
-        surf.blit(fonts['tiny'].render(f"ignored: {why}", True, UI_AMBER), (46, 46))
 
 
 # ─── CALIBRATION SCREENS ────────────────────────────────────────────────────
