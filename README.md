@@ -1,11 +1,11 @@
 # Muse Dino Runner
 
 The Chrome dinosaur game, controlled with a **Muse 2** EEG headband.
-Clench your jaw (or blink) and the dino jumps.
+**Blink and the dino jumps.**
 
 The Muse is good at telling *moving* from *still*, but not at telling *which* movement it was,
-so the game needs only one input: **move = jump**. High birds add a twist: you have to
-stay still and run under them.
+so the game needs only one input: **blink = jump**. High birds add a twist: you have to
+hold your blink and run under them.
 
 ## Setup (Windows, cmd)
 
@@ -28,8 +28,8 @@ pip install -r requirements.txt
    .venv\Scripts\activate.bat
    python dino_runner.py
    ```
-4. Calibrate (~20 s): stay still for 5 s, then clench your jaw 6 times on the green cue.
-   The game picks the 2 sensors that see your movement best.
+4. Calibrate (~20 s): stay still for 5 s, then blink firmly 6 times on the green cue.
+   The game picks the 2 sensors that see your blinks best.
 
 With no Muse connected, the game starts in keyboard mode.
 
@@ -42,7 +42,9 @@ With no Muse connected, the game starts in keyboard mode.
 
 ## Tips
 
-- Jaw clench works better than blinking: it's a stronger signal and you won't do it by accident.
+- Blink **firmly** in calibration and in the game. The jump threshold is set between "still" and
+  your firm blinks, so normal unconscious blinks usually don't trigger a jump.
+- Getting random jumps? Press C and recalibrate with firmer blinks.
 - If the calibration screen shows SNR below 2×, adjust the fit (sensors touching skin,
   hair out of the way, slightly damp sensors) and press C to redo it.
 - The bars at the top-left show live activity. Crossing the amber line makes the dino jump.

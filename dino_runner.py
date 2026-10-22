@@ -1,18 +1,18 @@
 """
-DINO RUNNER — the Chrome dinosaur game, controlled by ANY facial movement
-=========================================================================
+DINO RUNNER — the Chrome dinosaur game, controlled by BLINKING
+==============================================================
 The Muse is great at telling "moving" from "still", but bad at telling WHICH
-movement it was. So this game needs exactly one input: move = jump.
-Jaw clench works best (strong signal, you won't do it by accident).
+movement it was. So this game needs exactly one input: blink = jump.
+Blink FIRMLY — the threshold sits above your normal, unconscious blinks.
 
   1. Run `muselsl stream` in a terminal first.
   2. Run this script.
   3. Calibration:
        a. Stay STILL for 5 seconds (baseline noise)
-       b. CLENCH your jaw 6 times when prompted (or blink — just keep it the same move)
-     The script picks the 2 channels that see YOUR move best and sets thresholds.
-  4. Play. Clench to jump over cactuses.
-     Watch out for HIGH birds — stay still and run under them!
+       b. BLINK firmly 6 times when prompted
+     The script picks the 2 channels that see YOUR blinks best and sets thresholds.
+  4. Play. Blink to jump over cactuses.
+     Watch out for HIGH birds — don't blink, run under them!
 
 No Muse? The game still starts in keyboard mode (SPACE to jump).
 
@@ -38,7 +38,7 @@ SRATE           = 256
 ACT_WIN         = int(0.15 * SRATE)   # activity = peak-to-peak over the last 150 ms
 JUMP_COOLDOWN   = 0.35                # seconds between jumps
 REARM_FRAC      = 0.6                 # activity must fall below thr*this before next jump
-REARM_TIMEOUT   = 2.0                 # ...or re-arm anyway after this long (a held clench = 1 jump)
+REARM_TIMEOUT   = 2.0                 # ...or re-arm anyway after this long (one blink = one jump)
 
 # Calibration parameters
 CALIB_BASELINE_SEC = 5.0
@@ -382,30 +382,30 @@ def calib_screen_intro(screen, fonts):
     draw_centered(screen, fonts['big'], "DINO RUNNER", 60, UI_WHITE)
     draw_centered(screen, fonts['med'], "Quick calibration (~20 s)", 130, UI_WHITE)
     draw_centered(screen, fonts['small'], f"Step 1: stay completely still for {int(CALIB_BASELINE_SEC)} s", 185, (150, 200, 255))
-    draw_centered(screen, fonts['small'], f"Step 2: clench your jaw {CALIB_NUM_MOVES} times on the green cue", 215, (150, 200, 255))
-    draw_centered(screen, fonts['small'], "(any move works — blink, eyebrows — but use the SAME one in the game)", 245, (140, 140, 150))
+    draw_centered(screen, fonts['small'], f"Step 2: blink FIRMLY {CALIB_NUM_MOVES} times on the green cue", 215, (150, 200, 255))
+    draw_centered(screen, fonts['small'], "(a strong, deliberate blink — the same way you will blink in the game)", 245, (140, 140, 150))
     draw_centered(screen, fonts['big'], "Press SPACE", 310, (110, 230, 140))
 
 
 def calib_screen_baseline(screen, fonts, frac):
     screen.fill(DARK_BG)
     draw_centered(screen, fonts['big'], "STAY STILL", 100, (255, 200, 100))
-    draw_centered(screen, fonts['med'], "relax your face, don't blink if you can", 170, UI_WHITE)
+    draw_centered(screen, fonts['med'], "eyes open, try not to blink", 170, UI_WHITE)
     draw_progress_bar(screen, WIDTH // 2 - 200, 250, 400, 20, frac, (255, 200, 100))
 
 
 def calib_screen_move(screen, fonts, move_num, phase, phase_frac):
-    """phase: 'ready' (amber), 'cue' (green CLENCH!), 'capture' (blue), 'rest' (gray)"""
+    """phase: 'ready' (amber), 'cue' (green BLINK!), 'capture' (blue), 'rest' (gray)"""
     screen.fill(DARK_BG)
-    draw_centered(screen, fonts['med'], f"Move  {move_num} / {CALIB_NUM_MOVES}", 30, UI_WHITE)
+    draw_centered(screen, fonts['med'], f"Blink  {move_num} / {CALIB_NUM_MOVES}", 30, UI_WHITE)
 
     cx, cy = WIDTH // 2, HEIGHT // 2 - 10
     if phase == 'ready':
         col, msg, radius = (255, 200, 100), "get ready", 70 + int(15 * phase_frac)
     elif phase == 'cue':
-        col, msg, radius = (110, 230, 140), "CLENCH!", 110
+        col, msg, radius = (110, 230, 140), "BLINK!", 110
     elif phase == 'capture':
-        col, msg, radius = (100, 180, 255), "and relax", 90
+        col, msg, radius = (100, 180, 255), "good", 90
     else:
         col, msg, radius = (90, 90, 110), "wait…", 70
 
@@ -578,7 +578,7 @@ def run_game_loop(screen, clock, fonts, can_recalibrate, high):
             obstacles = [o for o in obstacles if not o.off_screen()]
 
         elif state == STATE_DEAD:
-            # A blink/clench restarts too (after a short pause so the death-move doesn't)
+            # A blink restarts too (after a short pause so the death-blink doesn't)
             if jumped and time.time() - dead_at > 1.0:
                 dino, obstacles, distance, speed, next_gap, state = new_game()
                 state = STATE_PLAYING
@@ -596,12 +596,12 @@ def run_game_loop(screen, clock, fonts, can_recalibrate, high):
 
         hint = "C = recalibrate   Q = quit" if can_recalibrate else "SPACE = jump   Q = quit"
         if state == STATE_WAITING:
-            draw_centered(screen, fonts['med'], "Clench (or SPACE) to start", 120)
-            draw_centered(screen, fonts['small'], "Jump cactuses and low birds • stay still under HIGH birds", 165, INK_LIGHT)
+            draw_centered(screen, fonts['med'], "Blink (or SPACE) to start", 120)
+            draw_centered(screen, fonts['small'], "Jump cactuses and low birds • don't blink under HIGH birds", 165, INK_LIGHT)
             draw_centered(screen, fonts['small'], hint, 195, INK_LIGHT)
         elif state == STATE_DEAD:
             draw_centered(screen, fonts['big'], "G A M E   O V E R", 110)
-            draw_centered(screen, fonts['small'], "clench or R to restart   •   " + hint, 175, INK_LIGHT)
+            draw_centered(screen, fonts['small'], "blink or R to restart   •   " + hint, 175, INK_LIGHT)
 
         pygame.display.flip()
 
