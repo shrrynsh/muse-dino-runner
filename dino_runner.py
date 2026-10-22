@@ -1,16 +1,22 @@
 """
 DINO RUNNER — the Chrome dinosaur game, controlled by BLINKING
 ==============================================================
-The Muse is great at telling "moving" from "still", but bad at telling WHICH
-movement it was. So this game needs exactly one input: blink = jump.
-A normal, clear blink is enough — calibration learns what YOUR blink looks like.
+Blink = jump. Everything else (jaw clenches, eyebrow raises, head movement)
+is ignored, because every candidate is checked three ways before it counts:
+
+  1. WHERE  — only a forehead sensor (AF7/AF8), right above the eyes, and only
+              a spike in the same direction as your calibration blinks.
+  2. SHAPE  — the spike must match the shape of YOUR blink (template matching,
+              correlation >= 0.8). Eyebrow raises are slower and look different.
+  3. MUSCLE — no burst of fast muscle noise on the ear sensors (TP9/TP10),
+              which is where jaw clenches show up.
 
   1. Run `muselsl stream` in a terminal first.
   2. Run this script.
   3. Calibration:
        a. Relax for a few seconds (baseline noise)
        b. Blink 6 times, whenever you like — each one is detected live
-     The script picks the 2 channels that see YOUR blinks best and sets thresholds.
+     The script learns your blink's size, direction and shape.
   4. Play. Blink to jump over cactuses.
      Watch out for HIGH birds — don't blink, run under them!
 
@@ -35,19 +41,26 @@ from scipy.signal import butter, sosfilt, sosfilt_zi
 
 # ─── EEG CONFIG ──────────────────────────────────────────────────────────────
 EEG_CHANNELS    = [(0, "TP9"), (1, "AF7"), (2, "AF8"), (3, "TP10")]
+FRONTAL         = [(1, "AF7"), (2, "AF8")]   # forehead, right above the eyes — where blinks are
+JAW_MUSCLE      = [0, 3]                     # TP9, TP10 — where jaw clenches show up
 SRATE           = 256
 BLINK_BAND      = (1.0, 8.0)          # Hz — blinks live here; drift, muscle noise and mains hum don't
-ACT_WIN         = int(0.15 * SRATE)   # activity = peak-to-peak over the last 150 ms
-JUMP_COOLDOWN   = 0.35                # seconds between jumps
-REARM_FRAC      = 0.6                 # activity must fall below thr*this before next jump
-REARM_TIMEOUT   = 2.0                 # ...or re-arm anyway after this long (one blink = one jump)
+MUSCLE_BAND     = (20.0, 45.0)        # Hz — muscle twitches (kept below 50 Hz mains hum)
+MUSCLE          = 4                   # filtered arrays are [blink band x4 | muscle band x4]
+ACT_WIN         = int(0.15 * SRATE)   # calibration activity = peak-to-peak over 150 ms
+
+# Blink check (see docstring)
+SHAPE_PRE       = int(0.30 * SRATE)   # blink shape window: this long before the peak...
+SHAPE_POST      = int(0.35 * SRATE)   # ...and this long after (so a jump comes ~0.4 s after a blink)
+SHAPE_MIN_CORR  = 0.8                 # how closely a spike must match your blink's shape (1 = identical)
+MIN_TRIGGER_X   = 5.0                 # never trigger on spikes smaller than this many times still-noise
 
 # Calibration parameters
 CALIB_BASELINE_SEC = 4.0
 CALIB_NUM_MOVES    = 6
 BLINK_MIN_RATIO    = 3.5     # a calibration blink counts once it's this many times above the still-noise
-BLINK_TAIL_SEC     = 0.5     # keep recording this long after a blink starts, to catch all of it
-BLINK_EPOCH_SEC    = 1.0     # how much signal to keep per calibration blink
+BLINK_TAIL_SEC     = 0.7     # keep recording this long after a blink starts, to catch all of it
+BLINK_EPOCH_SEC    = 1.4     # how much signal to keep per calibration blink
 CALIB_GOT_IT_SEC   = 0.6     # how long the "got it" flash stays on screen
 CALIB_HINT_SEC     = 10.0    # show fit tips if no blink is seen for this long
 THRESH_POS         = 0.2     # game trigger sits this far from still-noise (0) to your weakest blink (1)
@@ -58,9 +71,9 @@ FPS             = 60
 GROUND_Y        = HEIGHT - 70
 GRAVITY         = 0.8
 JUMP_VEL        = -15.5
-START_SPEED     = 5.5
-MAX_SPEED       = 12.0
-SPEED_UP        = 0.0012              # added to speed every frame
+START_SPEED     = 4.8                 # a little slower than Chrome's: blink checks add ~0.4 s
+MAX_SPEED       = 10.5
+SPEED_UP        = 0.0010              # added to speed every frame
 DINO_X          = 90
 BIRDS_AFTER     = 250                 # score at which birds start appearing
 
@@ -81,33 +94,40 @@ jump_event = threading.Event()
 
 # Filled in after calibration, read by HUD + live detection thread
 detect_config = {
-    "channels":     [],     # list of (idx, name, threshold)
-    "live_act":     {},     # per-channel current activity (for HUD)
+    "model":        None,   # blink model from compute_calibration()
+    "live":         0.0,    # current blink-direction signal on the forehead sensor (for HUD)
+    "ignored_at":   0.0,    # when a spike was last rejected as "not a blink" (for HUD)
+    "ignored_why":  "",
 }
 detect_lock = threading.Lock()
 stop_eeg    = threading.Event()
 
 
-# ─── NOISE FILTER + ACTIVITY MEASURE (shared by calibration + live detection) ─
+# ─── NOISE FILTERS + ACTIVITY MEASURE (shared by calibration + live detection) ─
 
-class BlinkFilter:
+class EEGFilter:
     """
-    Live band-pass filter for the 4 EEG channels, fed chunk by chunk.
-    Keeps blink-speed wiggles (BLINK_BAND) and throws away slow sensor drift,
-    fast muscle twitches and 50/60 Hz electrical hum — so small blinks stand out.
+    Live filters for the 4 EEG channels, fed chunk by chunk. Returns [N, 8]:
+      columns 0-3: blink band (BLINK_BAND) — slow drift, muscle twitches and
+                   50/60 Hz electrical hum removed, so small blinks stand out
+      columns 4-7: muscle band (MUSCLE_BAND) — used to spot jaw clenches
     """
     def __init__(self):
-        self.sos = butter(2, BLINK_BAND, btype='band', fs=SRATE, output='sos')
+        self.sos = [butter(2, BLINK_BAND, btype='band', fs=SRATE, output='sos'),
+                    butter(2, MUSCLE_BAND, btype='band', fs=SRATE, output='sos')]
         self.zi = None
 
     def __call__(self, chunk):
-        """chunk: [N, 4+] raw samples -> [N, 4] filtered."""
+        """chunk: [N, 4+] raw samples -> [N, 8] filtered."""
         x = np.asarray(chunk, dtype=np.float64)[:, :4]
         if self.zi is None:
             # Start "settled" at the first sample so the Muse's big DC offset doesn't ring
-            self.zi = sosfilt_zi(self.sos)[:, :, None] * x[0][None, None, :]
-        y, self.zi = sosfilt(self.sos, x, axis=0, zi=self.zi)
-        return y
+            self.zi = [sosfilt_zi(s)[:, :, None] * x[0][None, None, :] for s in self.sos]
+        out = []
+        for k, s in enumerate(self.sos):
+            y, self.zi[k] = sosfilt(s, x, axis=0, zi=self.zi[k])
+            out.append(y)
+        return np.hstack(out)
 
 
 def window_activity(sig):
@@ -118,55 +138,93 @@ def window_activity(sig):
     return np.ptp(np.lib.stride_tricks.sliding_window_view(sig, ACT_WIN), axis=1)
 
 
-# ─── LIVE DETECTION THREAD (post-calibration) ────────────────────────────────
+def rms(x):
+    return float(np.sqrt(np.mean(np.square(x))))
+
+
+# ─── BLINK DETECTOR (post-calibration) ───────────────────────────────────────
+
+class BlinkDetector:
+    """
+    Fed one filtered sample at a time. When the forehead signal spikes past the
+    trigger in the blink direction, it waits for the spike to finish, then checks
+    SHAPE and MUSCLE. Returns "blink", a reason string if rejected, or None.
+    """
+    def __init__(self, model):
+        self.m = model
+        self.win = SHAPE_PRE + SHAPE_POST
+        self.blink  = np.zeros(self.win)                    # rolling, oldest first
+        self.muscle = np.zeros((self.win, len(JAW_MUSCLE)))
+        self.n = 0
+        self.peak = None          # biggest value of the spike being tracked
+        self.since_peak = 0
+        self.armed = True         # wait for the signal to settle between spikes
+
+    def push(self, row):
+        m = self.m
+        v = m["sign"] * row[m["idx"]]
+        self.blink  = np.roll(self.blink, -1);     self.blink[-1] = v
+        self.muscle = np.roll(self.muscle, -1, 0); self.muscle[-1] = [row[MUSCLE + c] for c in JAW_MUSCLE]
+        self.n += 1
+
+        if not self.armed:
+            if v < 0.5 * m["amp_thr"]:
+                self.armed = True
+            return None
+        if self.peak is None:
+            if v > m["amp_thr"]:
+                self.peak, self.since_peak = v, 0
+            return None
+        if v > self.peak:
+            self.peak, self.since_peak = v, 0
+            return None
+        self.since_peak += 1
+        if self.since_peak < SHAPE_POST:
+            return None
+
+        # The spike peaked SHAPE_POST samples ago — the window is centred on it. Check it.
+        self.peak, self.armed = None, False
+        if self.n < self.win:
+            return None
+        z = (self.blink - self.blink.mean()) / (self.blink.std() + 1e-9)
+        corr = float(np.dot(z, m["template"]) / self.win)
+        if corr < SHAPE_MIN_CORR:
+            return f"wrong shape ({corr:.2f})"
+        if max(rms(self.muscle[:, k]) for k in range(len(JAW_MUSCLE))) > m["muscle_limit"]:
+            return "muscle noise"
+        return "blink"
+
 
 def eeg_detect_thread(inlet):
     with detect_lock:
-        chans = list(detect_config["channels"])
-    bufs = {idx: np.zeros(ACT_WIN) for idx, _, _ in chans}
-    ptr  = 0
-    armed = True
-    last_jump = 0.0
-    filt = BlinkFilter()
+        model = detect_config["model"]
+    det  = BlinkDetector(model)
+    filt = EEGFilter()
 
-    print(f"[EEG] Live detection on: {[(n, int(t)) for _, n, t in chans]}")
+    print(f"[EEG] Live detection on {model['name']}: trigger {model['amp_thr']:.0f}, "
+          f"shape >= {SHAPE_MIN_CORR}, muscle <= {model['muscle_limit']:.1f}")
 
     while not stop_eeg.is_set():
         raw, _ = inlet.pull_sample(timeout=0.5)
         if raw is None:
             continue
-        sample = filt([raw])[0]
-        for idx, _, _ in chans:
-            bufs[idx][ptr % ACT_WIN] = sample[idx]
-        ptr += 1
-        if ptr < ACT_WIN:
-            continue
-
-        over, calm = False, True
+        row = filt([raw])[0]
+        result = det.push(row)
         with detect_lock:
-            for idx, name, thr in chans:
-                act = float(np.ptp(bufs[idx]))
-                detect_config["live_act"][name] = act
-                if act > thr:
-                    over = True
-                if act > thr * REARM_FRAC:
-                    calm = False
-
-        now = time.time()
-        # One jump per movement: after firing, wait until the signal settles again
-        if not armed and (calm or now - last_jump > REARM_TIMEOUT):
-            armed = True
-        if over and armed and (now - last_jump) > JUMP_COOLDOWN:
+            detect_config["live"] = max(0.0, model["sign"] * row[model["idx"]])
+            if result and result != "blink":
+                detect_config["ignored_at"], detect_config["ignored_why"] = time.time(), result
+        if result == "blink":
             jump_event.set()
-            last_jump = now
-            armed = False
+        elif result:
+            print(f"[EEG] ignored: {result}")
 
 
 # ─── CALIBRATION HELPERS ────────────────────────────────────────────────────
 
 def drain_chunk(inlet, filt=None):
     """Pull all queued samples from the inlet without blocking.
-    Returns np.array [N, 5+], or filtered [N, 4] if a BlinkFilter is given."""
+    Returns np.array [N, 5+], or filtered [N, 8] if an EEGFilter is given."""
     samples, _ = inlet.pull_chunk(timeout=0.0, max_samples=1024)
     if samples:
         return filt(samples) if filt else np.array(samples)
@@ -174,7 +232,7 @@ def drain_chunk(inlet, filt=None):
 
 
 def noise_floors(baseline_arr):
-    """Per-channel activity level while sitting still: {idx: floor}."""
+    """Per-channel blink-band activity level while sitting still: {idx: floor}."""
     floors = {}
     for idx, _ in EEG_CHANNELS:
         act = window_activity(baseline_arr[:, idx])
@@ -197,43 +255,50 @@ def blink_strength(epoch_arr, floors):
 
 def compute_calibration(baseline_arr, move_epochs):
     """
-    For each channel, compare the activity while still with the peak activity of each
-    calibration blink. Pick channels where the weakest blink clearly beats the noise.
-    Threshold = THRESH_POS of the way from the noise up to the weakest blink.
+    Learn the user's blink from the relaxed baseline + calibration blinks (all filtered [N, 8]):
+      - which forehead sensor sees it best, and which direction it spikes
+      - trigger level: THRESH_POS of the way from still-noise to the weakest blink
+      - shape template: the average blink, centred on its peak
+      - muscle limit: how much jaw-muscle noise a real blink comes with
 
-    Returns: (top_channels [(idx, name, thr)], full_results [(name, snr, thr)])
+    Returns a model dict, or None if no usable blink was found.
     """
-    full = []
-    floors = noise_floors(baseline_arr)
-    for idx, name in EEG_CHANNELS:
-        if idx not in floors:
+    model = None
+    for idx, name in FRONTAL:
+        peaks = [ep[:, idx][np.argmax(np.abs(ep[:, idx]))] for ep in move_epochs]
+        sign  = 1.0 if np.median(peaks) > 0 else -1.0
+        amps  = [abs(p) for p in peaks if np.sign(p) == sign]
+        noise = float(np.percentile(np.abs(baseline_arr[:, idx]), 99))
+        if not amps:
             continue
-        noise_floor = floors[idx]
+        snr = float(np.median(amps)) / max(noise, 1e-3)
+        if model is None or snr > model["snr"]:
+            weakest = float(np.percentile(amps, 20))
+            amp_thr = max(noise + THRESH_POS * (weakest - noise), MIN_TRIGGER_X * noise)
+            model = dict(idx=idx, name=name, sign=sign, noise=noise, snr=snr,
+                         amp_thr=min(amp_thr, 0.8 * weakest))
+    if model is None:
+        return None
 
-        move_peaks = []
-        for ep in move_epochs:
-            act = window_activity(ep[:, idx])
-            if len(act):
-                move_peaks.append(float(np.max(act)))
-        if not move_peaks:
+    idx, sign = model["idx"], model["sign"]
+    shapes, blink_muscle = [], []
+    for ep in move_epochs:
+        s = sign * ep[:, idx]
+        p = int(np.argmax(s))
+        if p - SHAPE_PRE < 0 or p + SHAPE_POST > len(s):
             continue
-        weakest_move = float(np.percentile(move_peaks, 20))
-        median_move  = float(np.median(move_peaks))
+        w = s[p - SHAPE_PRE:p + SHAPE_POST]
+        shapes.append((w - w.mean()) / (w.std() + 1e-9))
+        blink_muscle.append(max(rms(ep[p - SHAPE_PRE:p + SHAPE_POST, MUSCLE + c]) for c in JAW_MUSCLE))
+    if not shapes:
+        return None
+    model["template"] = np.mean(shapes, axis=0)
 
-        snr = median_move / max(noise_floor, 1e-3)
-        if weakest_move > noise_floor:
-            thr = noise_floor + THRESH_POS * (weakest_move - noise_floor)
-        else:
-            thr = noise_floor * 1.3       # moves barely beat noise — stay just above it
-        full.append((idx, name, snr, thr))
-
-    full_sorted = sorted(full, key=lambda x: -x[2])
-    reliable = [r for r in full_sorted if r[2] > 2.0] or full_sorted[:2]
-
-    top = reliable[:2]
-    top_chans   = [(idx, name, thr) for idx, name, snr, thr in top]
-    full_report = [(name, snr, thr) for _, name, snr, thr in full_sorted]
-    return top_chans, full_report
+    win = SHAPE_PRE + SHAPE_POST
+    still_muscle = [max(rms(baseline_arr[i:i + win, MUSCLE + c]) for c in JAW_MUSCLE)
+                    for i in range(0, len(baseline_arr) - win, SHAPE_POST)] or [0.0]
+    model["muscle_limit"] = max(3.0 * float(np.median(still_muscle)), 1.5 * float(np.max(blink_muscle)))
+    return model
 
 
 # ─── GAME OBJECTS ────────────────────────────────────────────────────────────
@@ -401,23 +466,23 @@ def draw_hud_play(surf, fonts, score, high):
     surf.blit(s, (WIDTH - s.get_width() - 20, 16))
 
     with detect_lock:
-        chans = list(detect_config["channels"])
-        live  = dict(detect_config["live_act"])
-    if not chans:
+        model = detect_config["model"]
+        val   = detect_config["live"]
+        ignored_at, why = detect_config["ignored_at"], detect_config["ignored_why"]
+    if model is None:
         surf.blit(fonts['tiny'].render("KEYBOARD MODE", True, INK_LIGHT), (12, 10))
         return
-    surf.blit(fonts['tiny'].render("EEG ●", True, UI_GREEN), (12, 10))
-    # Bars are scaled so the threshold sits at the middle tick
-    bar_max = 40
-    for i, (idx, name, thr) in enumerate(chans):
-        val = live.get(name, 0)
-        bar_h = int(min(1.0, val / (2 * thr)) * bar_max) if thr > 0 else 0
-        x = 12 + i * 40
-        col = UI_RED if val > thr else UI_BLUE
-        pygame.draw.rect(surf, (230, 230, 230), (x, 28, 26, bar_max))
-        pygame.draw.rect(surf, col, (x, 28 + bar_max - bar_h, 26, bar_h))
-        pygame.draw.line(surf, UI_AMBER, (x - 2, 28 + bar_max // 2), (x + 28, 28 + bar_max // 2), 2)
-        surf.blit(fonts['tiny'].render(name, True, INK), (x, 72))
+    surf.blit(fonts['tiny'].render(f"EEG ●  {model['name']}", True, UI_GREEN), (12, 10))
+    # Bar is scaled so the trigger sits at the middle tick
+    bar_max, thr, x = 40, model["amp_thr"], 12
+    bar_h = int(min(1.0, val / (2 * thr)) * bar_max)
+    col = UI_RED if val > thr else UI_BLUE
+    pygame.draw.rect(surf, (230, 230, 230), (x, 28, 26, bar_max))
+    pygame.draw.rect(surf, col, (x, 28 + bar_max - bar_h, 26, bar_h))
+    pygame.draw.line(surf, UI_AMBER, (x - 2, 28 + bar_max // 2), (x + 28, 28 + bar_max // 2), 2)
+    # Show when a spike was ignored, so the player can see the filter at work
+    if time.time() - ignored_at < 1.2:
+        surf.blit(fonts['tiny'].render(f"ignored: {why}", True, UI_AMBER), (46, 46))
 
 
 # ─── CALIBRATION SCREENS ────────────────────────────────────────────────────
@@ -486,9 +551,9 @@ def calib_screen_blinks(screen, fonts, count, flash, level, show_hint):
     draw_blink_meter(screen, fonts, level)
 
 
-def calib_screen_results(screen, fonts, top_chans, all_chans):
+def calib_screen_results(screen, fonts, model):
     screen.fill(DARK_BG)
-    best = all_chans[0][1] if all_chans else 0
+    best = model["snr"]
     if best >= 5:
         verdict, col = "Great signal", (110, 230, 140)
     elif best >= 2:
@@ -500,8 +565,9 @@ def calib_screen_results(screen, fonts, top_chans, all_chans):
     draw_centered(screen, fonts['med'], verdict, 130, col)
     draw_centered(screen, fonts['small'],
                   f"your blink is {best:.1f}x stronger than when you're relaxed", 170, (150, 200, 255))
-    names = " + ".join(n for _, n, _ in top_chans)
-    draw_centered(screen, fonts['tiny'], f"using sensors {names}", 200, (140, 140, 150))
+    draw_centered(screen, fonts['tiny'],
+                  f"using forehead sensor {model['name']} — jaw clenches & eyebrow raises are ignored",
+                  200, (140, 140, 150))
     if best < 2:
         draw_centered(screen, fonts['small'], "Adjust the headband fit and press C to redo.", 240, UI_RED)
     draw_centered(screen, fonts['med'], "SPACE = play     C = redo", HEIGHT - 70, (110, 230, 140))
@@ -510,8 +576,8 @@ def calib_screen_results(screen, fonts, top_chans, all_chans):
 # ─── CALIBRATION RUNNER ─────────────────────────────────────────────────────
 
 def run_calibration(screen, clock, fonts, inlet):
-    """Returns (top_channels, all_channels_report)."""
-    filt = BlinkFilter()   # one filter for the whole session, fed every sample in order
+    """Returns the blink model (see compute_calibration)."""
+    filt = EEGFilter()     # one filter for the whole session, fed every sample in order
 
     def handle_keys():
         """Quit on Q/ESC. Returns True if C (start over) was pressed."""
@@ -543,7 +609,7 @@ def run_calibration(screen, clock, fonts, inlet):
 
     def collect_blinks(floors):
         """Wait for the user to blink CALIB_NUM_MOVES times. Returns epochs, or None on restart."""
-        recent  = np.zeros((0, 4))
+        recent  = np.zeros((0, 8))
         keep_n  = int(2 * SRATE)                  # rolling 2 s of signal
         look_n  = int(0.3 * SRATE)                # "is there a blink right now?" window
         epochs  = []
@@ -595,7 +661,7 @@ def run_calibration(screen, clock, fonts, inlet):
             calib_screen_baseline(screen, fonts, time.time() - start)
             pygame.display.flip()
             clock.tick(FPS)
-        baseline_arr = np.vstack(baseline_samples) if baseline_samples else np.zeros((0, 4))
+        baseline_arr = np.vstack(baseline_samples) if baseline_samples else np.zeros((0, 8))
         floors = noise_floors(baseline_arr)
 
         # ── Phase 2: blinks, whenever the user is ready ──
@@ -604,13 +670,15 @@ def run_calibration(screen, clock, fonts, inlet):
             continue
 
         # ── Compute & show results ──
-        top_chans, full_report = compute_calibration(baseline_arr, move_epochs)
-        print(f"[CALIB] Top channels: {[(n, int(t)) for _, n, t in top_chans]}")
-        print(f"[CALIB] Full SNR: {[(n, round(s, 2)) for n, s, _ in full_report]}")
+        model = compute_calibration(baseline_arr, move_epochs)
+        if model is None:
+            print("[CALIB] Couldn't learn a blink from the forehead sensors — redoing.")
+            continue
+        print(f"[CALIB] {model['name']}: blink {model['snr']:.1f}x noise, trigger {model['amp_thr']:.0f}, "
+              f"muscle limit {model['muscle_limit']:.1f}")
 
-        if top_chans and wait_for_space(
-                lambda: calib_screen_results(screen, fonts, top_chans, full_report)):
-            return top_chans, full_report
+        if wait_for_space(lambda: calib_screen_results(screen, fonts, model)):
+            return model
 
 
 # ─── MAIN GAME LOOP ─────────────────────────────────────────────────────────
@@ -754,10 +822,10 @@ def main():
             eeg_thread_handle.join(timeout=2.0)
             stop_eeg.clear()
 
-        top_chans, _ = run_calibration(screen, clock, fonts, inlet)
+        model = run_calibration(screen, clock, fonts, inlet)
         with detect_lock:
-            detect_config["channels"] = top_chans
-            detect_config["live_act"] = {n: 0 for _, n, _ in top_chans}
+            detect_config["model"] = model
+            detect_config["live"]  = 0.0
 
         eeg_thread_handle = threading.Thread(target=eeg_detect_thread,
                                              args=(inlet,), daemon=True)
