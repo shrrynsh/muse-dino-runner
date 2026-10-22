@@ -46,6 +46,9 @@ CALIB_NUM_MOVES    = 6
 CALIB_PRE_CUE_SEC  = 1.2
 CALIB_CAPTURE_SEC  = 1.2
 CALIB_REST_SEC     = 0.6
+CALIB_RESULT_SEC   = 0.9     # how long "GOT IT" / "MISSED" stays on screen
+BLINK_MIN_RATIO    = 6.0     # a cued blink only counts if it's this many times above the still-noise
+CALIB_MAX_TRIES    = 15      # give up asking for more blinks after this many cues
 
 # ─── GAME CONFIG ─────────────────────────────────────────────────────────────
 WIDTH, HEIGHT   = 960, 400
@@ -145,6 +148,26 @@ def drain_chunk(inlet):
     return None
 
 
+def noise_floors(baseline_arr):
+    """Per-channel activity level while sitting still: {idx: floor}."""
+    floors = {}
+    for idx, _ in EEG_CHANNELS:
+        act = window_activity(baseline_arr[:, idx])
+        if len(act):
+            floors[idx] = float(np.percentile(act, 99))   # ignore a single stray blip
+    return floors
+
+
+def blink_strength(epoch_arr, floors):
+    """How far above still-noise the biggest bump in this epoch is (best channel), e.g. 5.0 = 5x."""
+    best = 0.0
+    for idx, floor in floors.items():
+        act = window_activity(epoch_arr[:, idx])
+        if len(act):
+            best = max(best, float(np.max(act)) / max(floor, 1e-3))
+    return best
+
+
 def compute_calibration(baseline_arr, move_epochs):
     """
     For each channel, compare the activity while still with the peak activity of each
@@ -154,11 +177,11 @@ def compute_calibration(baseline_arr, move_epochs):
     Returns: (top_channels [(idx, name, thr)], full_results [(name, snr, thr)])
     """
     full = []
+    floors = noise_floors(baseline_arr)
     for idx, name in EEG_CHANNELS:
-        noise_act = window_activity(baseline_arr[:, idx])
-        if len(noise_act) == 0:
+        if idx not in floors:
             continue
-        noise_floor = float(np.percentile(noise_act, 99))   # ignore a single stray blip
+        noise_floor = floors[idx]
 
         move_peaks = []
         for ep in move_epochs:
@@ -394,24 +417,55 @@ def calib_screen_baseline(screen, fonts, frac):
     draw_progress_bar(screen, WIDTH // 2 - 200, 250, 400, 20, frac, (255, 200, 100))
 
 
-def calib_screen_move(screen, fonts, move_num, phase, phase_frac):
-    """phase: 'ready' (amber), 'cue' (green BLINK!), 'capture' (blue), 'rest' (gray)"""
+def calib_screen_move(screen, fonts, move_num, phase, phase_frac, level=0.0):
+    """
+    phase: 'ready' (amber), 'cue' (green BLINK!), 'capture' (blue), 'hit' (green GOT IT),
+           'miss' (red MISSED), 'rest' (gray)
+    level: strongest blink seen so far this cue, as a multiple of still-noise
+    """
     screen.fill(DARK_BG)
-    draw_centered(screen, fonts['med'], f"Blink  {move_num} / {CALIB_NUM_MOVES}", 30, UI_WHITE)
+    draw_centered(screen, fonts['med'], f"Blink  {move_num} / {CALIB_NUM_MOVES}", 20, UI_WHITE)
 
-    cx, cy = WIDTH // 2, HEIGHT // 2 - 10
+    cx, cy = WIDTH // 2, HEIGHT // 2 - 20
     if phase == 'ready':
         col, msg, radius = (255, 200, 100), "get ready", 70 + int(15 * phase_frac)
     elif phase == 'cue':
         col, msg, radius = (110, 230, 140), "BLINK!", 110
     elif phase == 'capture':
-        col, msg, radius = (100, 180, 255), "good", 90
+        col, msg, radius = (100, 180, 255), "…", 90
+    elif phase == 'hit':
+        col, msg, radius = (110, 230, 140), "GOT IT", 100
+    elif phase == 'miss':
+        col, msg, radius = UI_RED, "MISSED", 100
     else:
         col, msg, radius = (90, 90, 110), "wait…", 70
 
     pygame.draw.circle(screen, col, (cx, cy), radius)
     pygame.draw.circle(screen, DARK_BG, (cx, cy), radius - 12)
     draw_centered(screen, fonts['big'], msg, cy - 24, col)
+    if phase == 'miss':
+        draw_centered(screen, fonts['small'], "no blink seen — blink harder, let's redo this one",
+                      cy + radius + 8, UI_RED)
+
+    # Live meter: how strong the blink was; it has to pass the white line to count
+    bw, bh = 400, 14
+    bx, by = WIDTH // 2 - bw // 2, HEIGHT - 40
+    scale = BLINK_MIN_RATIO * 2
+    fill_col = (110, 230, 140) if level >= BLINK_MIN_RATIO else (100, 180, 255)
+    pygame.draw.rect(screen, (70, 70, 80), (bx, by, bw, bh), border_radius=4)
+    pygame.draw.rect(screen, fill_col, (bx, by, int(bw * min(1.0, level / scale)), bh), border_radius=4)
+    pygame.draw.line(screen, UI_WHITE, (bx + bw // 2, by - 4), (bx + bw // 2, by + bh + 4), 2)
+    screen.blit(fonts['tiny'].render(f"blink signal {level:4.1f}x", True, (140, 140, 150)), (bx, by - 18))
+
+
+def calib_screen_no_blinks(screen, fonts):
+    screen.fill(DARK_BG)
+    draw_centered(screen, fonts['big'], "NO BLINKS DETECTED", 60, UI_RED)
+    draw_centered(screen, fonts['small'], "The headband isn't picking up your blinks. Try:", 140, UI_WHITE)
+    draw_centered(screen, fonts['small'], "• press the forehead sensors flat against your skin", 180, (150, 200, 255))
+    draw_centered(screen, fonts['small'], "• move hair away from behind your ears, dampen the sensors", 210, (150, 200, 255))
+    draw_centered(screen, fonts['small'], "• stay really still during the 'STAY STILL' step", 240, (150, 200, 255))
+    draw_centered(screen, fonts['med'], "SPACE = try again", HEIGHT - 60, (110, 230, 140))
 
 
 def calib_screen_results(screen, fonts, top_chans, all_chans):
@@ -483,18 +537,38 @@ def run_calibration(screen, clock, fonts, inlet):
                     lambda f: calib_screen_baseline(screen, fonts, f), baseline_samples)
         baseline_arr = np.vstack(baseline_samples) if baseline_samples else np.zeros((0, 5))
 
-        # ── Phase 2: cued movements ──
+        floors = noise_floors(baseline_arr)
+
+        # ── Phase 2: cued blinks — only real blinks count, missed ones are redone ──
         move_epochs = []
-        for n in range(1, CALIB_NUM_MOVES + 1):
+        tries = 0
+        while len(move_epochs) < CALIB_NUM_MOVES and tries < CALIB_MAX_TRIES:
+            tries += 1
+            n = len(move_epochs) + 1
             timed_phase(CALIB_PRE_CUE_SEC, lambda f: calib_screen_move(screen, fonts, n, 'ready', f))
             drain_chunk(inlet)   # clear backlog right before cue
             epoch = []
-            timed_phase(0.35, lambda f: calib_screen_move(screen, fonts, n, 'cue', f), epoch)
+
+            def live_level():
+                return blink_strength(np.vstack(epoch), floors) if epoch else 0.0
+
+            timed_phase(0.35, lambda f: calib_screen_move(screen, fonts, n, 'cue', f, live_level()), epoch)
             timed_phase(CALIB_CAPTURE_SEC - 0.35,
-                        lambda f: calib_screen_move(screen, fonts, n, 'capture', f), epoch)
-            if epoch:
+                        lambda f: calib_screen_move(screen, fonts, n, 'capture', f, live_level()), epoch)
+
+            level = live_level()
+            got_it = level >= BLINK_MIN_RATIO
+            print(f"[CALIB] cue {tries}: blink signal {level:.1f}x -> {'GOT IT' if got_it else 'MISSED'}")
+            if got_it:
                 move_epochs.append(np.vstack(epoch))
+            timed_phase(CALIB_RESULT_SEC,
+                        lambda f: calib_screen_move(screen, fonts, n, 'hit' if got_it else 'miss', f, level))
             timed_phase(CALIB_REST_SEC, lambda f: calib_screen_move(screen, fonts, n, 'rest', f))
+
+        if not move_epochs:
+            print("[CALIB] No blinks detected — check the headband fit.")
+            wait_for_space(lambda: calib_screen_no_blinks(screen, fonts))
+            continue
 
         # ── Compute & show results ──
         top_chans, full_report = compute_calibration(baseline_arr, move_epochs)
