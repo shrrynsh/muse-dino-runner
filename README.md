@@ -44,8 +44,10 @@ With no Muse connected, the game starts in keyboard mode.
 ## Tips
 
 - Blink in calibration the same way you'll blink in the game. A normal, clear blink is enough.
-- Too many random jumps? Raise `THRESH_POS` in `dino_runner.py` (e.g. 0.5).
-  Have to blink too hard? Lower it (e.g. 0.3).
+- The signal is band-pass filtered (1–8 Hz) to strip out sensor drift, muscle noise and
+  electrical hum, so even light blinks stand out.
+- Too many random jumps? Raise `THRESH_POS` in `dino_runner.py` (e.g. 0.3).
+  Light blinks not registering? Lower it (e.g. 0.1).
 - If the calibration screen shows SNR below 2×, adjust the fit (sensors touching skin,
   hair out of the way, slightly damp sensors) and press C to redo it.
 - The bars at the top-left show live activity. Crossing the amber line makes the dino jump.

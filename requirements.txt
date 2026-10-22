@@ -3,3 +3,4 @@ pylsl
 pygame
 numpy
 bitstring<5  # bitstring 5 breaks muselsl 2.5.3
+scipy

@@ -31,10 +31,12 @@ import threading
 import numpy as np
 import pygame
 from pylsl import StreamInlet, resolve_byprop
+from scipy.signal import butter, sosfilt, sosfilt_zi
 
 # ─── EEG CONFIG ──────────────────────────────────────────────────────────────
 EEG_CHANNELS    = [(0, "TP9"), (1, "AF7"), (2, "AF8"), (3, "TP10")]
 SRATE           = 256
+BLINK_BAND      = (1.0, 8.0)          # Hz — blinks live here; drift, muscle noise and mains hum don't
 ACT_WIN         = int(0.15 * SRATE)   # activity = peak-to-peak over the last 150 ms
 JUMP_COOLDOWN   = 0.35                # seconds between jumps
 REARM_FRAC      = 0.6                 # activity must fall below thr*this before next jump
@@ -48,7 +50,7 @@ BLINK_TAIL_SEC     = 0.5     # keep recording this long after a blink starts, to
 BLINK_EPOCH_SEC    = 1.0     # how much signal to keep per calibration blink
 CALIB_GOT_IT_SEC   = 0.6     # how long the "got it" flash stays on screen
 CALIB_HINT_SEC     = 10.0    # show fit tips if no blink is seen for this long
-THRESH_POS         = 0.4     # game trigger sits this far from still-noise (0) to your weakest blink (1)
+THRESH_POS         = 0.2     # game trigger sits this far from still-noise (0) to your weakest blink (1)
 
 # ─── GAME CONFIG ─────────────────────────────────────────────────────────────
 WIDTH, HEIGHT   = 960, 400
@@ -86,7 +88,27 @@ detect_lock = threading.Lock()
 stop_eeg    = threading.Event()
 
 
-# ─── ACTIVITY MEASURE (shared by calibration + live detection) ──────────────
+# ─── NOISE FILTER + ACTIVITY MEASURE (shared by calibration + live detection) ─
+
+class BlinkFilter:
+    """
+    Live band-pass filter for the 4 EEG channels, fed chunk by chunk.
+    Keeps blink-speed wiggles (BLINK_BAND) and throws away slow sensor drift,
+    fast muscle twitches and 50/60 Hz electrical hum — so small blinks stand out.
+    """
+    def __init__(self):
+        self.sos = butter(2, BLINK_BAND, btype='band', fs=SRATE, output='sos')
+        self.zi = None
+
+    def __call__(self, chunk):
+        """chunk: [N, 4+] raw samples -> [N, 4] filtered."""
+        x = np.asarray(chunk, dtype=np.float64)[:, :4]
+        if self.zi is None:
+            # Start "settled" at the first sample so the Muse's big DC offset doesn't ring
+            self.zi = sosfilt_zi(self.sos)[:, :, None] * x[0][None, None, :]
+        y, self.zi = sosfilt(self.sos, x, axis=0, zi=self.zi)
+        return y
+
 
 def window_activity(sig):
     """Peak-to-peak over every ACT_WIN-sample sliding window of a 1-D signal."""
@@ -105,13 +127,15 @@ def eeg_detect_thread(inlet):
     ptr  = 0
     armed = True
     last_jump = 0.0
+    filt = BlinkFilter()
 
     print(f"[EEG] Live detection on: {[(n, int(t)) for _, n, t in chans]}")
 
     while not stop_eeg.is_set():
-        sample, _ = inlet.pull_sample(timeout=0.5)
-        if sample is None:
+        raw, _ = inlet.pull_sample(timeout=0.5)
+        if raw is None:
             continue
+        sample = filt([raw])[0]
         for idx, _, _ in chans:
             bufs[idx][ptr % ACT_WIN] = sample[idx]
         ptr += 1
@@ -140,11 +164,12 @@ def eeg_detect_thread(inlet):
 
 # ─── CALIBRATION HELPERS ────────────────────────────────────────────────────
 
-def drain_chunk(inlet):
-    """Pull all queued samples from the inlet without blocking. Returns np.array [N, 5+]."""
+def drain_chunk(inlet, filt=None):
+    """Pull all queued samples from the inlet without blocking.
+    Returns np.array [N, 5+], or filtered [N, 4] if a BlinkFilter is given."""
     samples, _ = inlet.pull_chunk(timeout=0.0, max_samples=1024)
     if samples:
-        return np.array(samples)
+        return filt(samples) if filt else np.array(samples)
     return None
 
 
@@ -486,6 +511,7 @@ def calib_screen_results(screen, fonts, top_chans, all_chans):
 
 def run_calibration(screen, clock, fonts, inlet):
     """Returns (top_channels, all_channels_report)."""
+    filt = BlinkFilter()   # one filter for the whole session, fed every sample in order
 
     def handle_keys():
         """Quit on Q/ESC. Returns True if C (start over) was pressed."""
@@ -511,13 +537,13 @@ def run_calibration(screen, clock, fonts, inlet):
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_c:
                     return False
             draw()
-            drain_chunk(inlet)
+            drain_chunk(inlet, filt)
             pygame.display.flip()
             clock.tick(FPS)
 
     def collect_blinks(floors):
         """Wait for the user to blink CALIB_NUM_MOVES times. Returns epochs, or None on restart."""
-        recent  = np.zeros((0, 5))
+        recent  = np.zeros((0, 4))
         keep_n  = int(2 * SRATE)                  # rolling 2 s of signal
         look_n  = int(0.3 * SRATE)                # "is there a blink right now?" window
         epochs  = []
@@ -529,9 +555,9 @@ def run_calibration(screen, clock, fonts, inlet):
         while len(epochs) < CALIB_NUM_MOVES or time.time() < flash_until:
             if handle_keys():
                 return None
-            chunk = drain_chunk(inlet)
+            chunk = drain_chunk(inlet, filt)
             if chunk is not None:
-                recent = np.vstack([recent, chunk[:, :5]])[-keep_n:]
+                recent = np.vstack([recent, chunk])[-keep_n:]
             level = blink_strength(recent[-look_n:], floors) if len(recent) >= look_n else 0.0
             now = time.time()
 
@@ -558,18 +584,18 @@ def run_calibration(screen, clock, fonts, inlet):
         wait_for_space(lambda: calib_screen_intro(screen, fonts))
 
         # ── Phase 1: a few relaxed seconds, to measure the noise floor ──
-        drain_chunk(inlet)
+        drain_chunk(inlet, filt)
         baseline_samples = []
         start = time.time()
         while time.time() - start < CALIB_BASELINE_SEC:
             handle_keys()
-            chunk = drain_chunk(inlet)
+            chunk = drain_chunk(inlet, filt)
             if chunk is not None:
                 baseline_samples.append(chunk)
             calib_screen_baseline(screen, fonts, time.time() - start)
             pygame.display.flip()
             clock.tick(FPS)
-        baseline_arr = np.vstack(baseline_samples) if baseline_samples else np.zeros((0, 5))
+        baseline_arr = np.vstack(baseline_samples) if baseline_samples else np.zeros((0, 4))
         floors = noise_floors(baseline_arr)
 
         # ── Phase 2: blinks, whenever the user is ready ──
