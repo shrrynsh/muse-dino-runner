@@ -2,14 +2,13 @@
 DINO RUNNER — the Chrome dinosaur game, controlled by BLINKING
 ==============================================================
 Blink = jump. Everything else (jaw clenches, eyebrow raises, head movement)
-is ignored, because every candidate is checked three ways before it counts:
+is ignored, because every candidate is checked two ways before it counts:
 
   1. WHERE  — only a forehead sensor (AF7/AF8), right above the eyes, and only
               a spike in the same direction as your calibration blinks.
-  2. SHAPE  — the spike must match the shape of YOUR blink (template matching,
-              correlation >= 0.8). Eyebrow raises are slower and look different.
-  3. MUSCLE — no burst of fast muscle noise on the ear sensors (TP9/TP10),
-              which is where jaw clenches show up.
+              (Jaw clenches show up behind the ears, so they never get this far.)
+  2. SHAPE  — the spike must match the shape of YOUR blink (template matching).
+              Eyebrow raises are slower and look different.
 
   1. Run `muselsl stream` in a terminal first.
   2. Run this script.
@@ -42,17 +41,14 @@ from scipy.signal import butter, sosfilt, sosfilt_zi
 # ─── EEG CONFIG ──────────────────────────────────────────────────────────────
 EEG_CHANNELS    = [(0, "TP9"), (1, "AF7"), (2, "AF8"), (3, "TP10")]
 FRONTAL         = [(1, "AF7"), (2, "AF8")]   # forehead, right above the eyes — where blinks are
-JAW_MUSCLE      = [0, 3]                     # TP9, TP10 — where jaw clenches show up
 SRATE           = 256
 BLINK_BAND      = (1.0, 8.0)          # Hz — blinks live here; drift, muscle noise and mains hum don't
-MUSCLE_BAND     = (20.0, 45.0)        # Hz — muscle twitches (kept below 50 Hz mains hum)
-MUSCLE          = 4                   # filtered arrays are [blink band x4 | muscle band x4]
 ACT_WIN         = int(0.15 * SRATE)   # calibration activity = peak-to-peak over 150 ms
 
 # Blink check (see docstring)
-SHAPE_PRE       = int(0.30 * SRATE)   # blink shape window: this long before the peak...
-SHAPE_POST      = int(0.35 * SRATE)   # ...and this long after (so a jump comes ~0.4 s after a blink)
-SHAPE_MIN_CORR  = 0.8                 # how closely a spike must match your blink's shape (1 = identical)
+SHAPE_PRE       = int(0.25 * SRATE)   # blink shape window: this long before the peak...
+SHAPE_POST      = int(0.15 * SRATE)   # ...and this long after (so a jump comes ~0.2 s after a blink)
+SHAPE_MIN_CORR  = 0.7                 # how closely a spike must match your blink's shape (1 = identical)
 MIN_TRIGGER_X   = 5.0                 # never trigger on spikes smaller than this many times still-noise
 
 # Calibration parameters
@@ -71,7 +67,7 @@ FPS             = 60
 GROUND_Y        = HEIGHT - 70
 GRAVITY         = 0.8
 JUMP_VEL        = -15.5
-START_SPEED     = 4.8                 # a little slower than Chrome's: blink checks add ~0.4 s
+START_SPEED     = 4.8                 # a little slower than Chrome's: the blink check adds ~0.2 s
 MAX_SPEED       = 10.5
 SPEED_UP        = 0.0010              # added to speed every frame
 DINO_X          = 90
@@ -107,27 +103,22 @@ stop_eeg    = threading.Event()
 
 class EEGFilter:
     """
-    Live filters for the 4 EEG channels, fed chunk by chunk. Returns [N, 8]:
-      columns 0-3: blink band (BLINK_BAND) — slow drift, muscle twitches and
-                   50/60 Hz electrical hum removed, so small blinks stand out
-      columns 4-7: muscle band (MUSCLE_BAND) — used to spot jaw clenches
+    Live band-pass filter for the 4 EEG channels, fed chunk by chunk.
+    Keeps blink-speed wiggles (BLINK_BAND) and throws away slow sensor drift,
+    fast muscle twitches and 50/60 Hz electrical hum — so small blinks stand out.
     """
     def __init__(self):
-        self.sos = [butter(2, BLINK_BAND, btype='band', fs=SRATE, output='sos'),
-                    butter(2, MUSCLE_BAND, btype='band', fs=SRATE, output='sos')]
+        self.sos = butter(2, BLINK_BAND, btype='band', fs=SRATE, output='sos')
         self.zi = None
 
     def __call__(self, chunk):
-        """chunk: [N, 4+] raw samples -> [N, 8] filtered."""
+        """chunk: [N, 4+] raw samples -> [N, 4] filtered."""
         x = np.asarray(chunk, dtype=np.float64)[:, :4]
         if self.zi is None:
             # Start "settled" at the first sample so the Muse's big DC offset doesn't ring
-            self.zi = [sosfilt_zi(s)[:, :, None] * x[0][None, None, :] for s in self.sos]
-        out = []
-        for k, s in enumerate(self.sos):
-            y, self.zi[k] = sosfilt(s, x, axis=0, zi=self.zi[k])
-            out.append(y)
-        return np.hstack(out)
+            self.zi = sosfilt_zi(self.sos)[:, :, None] * x[0][None, None, :]
+        y, self.zi = sosfilt(self.sos, x, axis=0, zi=self.zi)
+        return y
 
 
 def window_activity(sig):
@@ -138,23 +129,18 @@ def window_activity(sig):
     return np.ptp(np.lib.stride_tricks.sliding_window_view(sig, ACT_WIN), axis=1)
 
 
-def rms(x):
-    return float(np.sqrt(np.mean(np.square(x))))
-
-
 # ─── BLINK DETECTOR (post-calibration) ───────────────────────────────────────
 
 class BlinkDetector:
     """
     Fed one filtered sample at a time. When the forehead signal spikes past the
-    trigger in the blink direction, it waits for the spike to finish, then checks
-    SHAPE and MUSCLE. Returns "blink", a reason string if rejected, or None.
+    trigger in the blink direction, it waits for the spike to peak, then checks
+    its SHAPE. Returns "blink", a reason string if rejected, or None.
     """
     def __init__(self, model):
         self.m = model
         self.win = SHAPE_PRE + SHAPE_POST
-        self.blink  = np.zeros(self.win)                    # rolling, oldest first
-        self.muscle = np.zeros((self.win, len(JAW_MUSCLE)))
+        self.blink = np.zeros(self.win)       # rolling, oldest first
         self.n = 0
         self.peak = None          # biggest value of the spike being tracked
         self.since_peak = 0
@@ -163,8 +149,8 @@ class BlinkDetector:
     def push(self, row):
         m = self.m
         v = m["sign"] * row[m["idx"]]
-        self.blink  = np.roll(self.blink, -1);     self.blink[-1] = v
-        self.muscle = np.roll(self.muscle, -1, 0); self.muscle[-1] = [row[MUSCLE + c] for c in JAW_MUSCLE]
+        self.blink = np.roll(self.blink, -1)
+        self.blink[-1] = v
         self.n += 1
 
         if not self.armed:
@@ -190,8 +176,6 @@ class BlinkDetector:
         corr = float(np.dot(z, m["template"]) / self.win)
         if corr < SHAPE_MIN_CORR:
             return f"wrong shape ({corr:.2f})"
-        if max(rms(self.muscle[:, k]) for k in range(len(JAW_MUSCLE))) > m["muscle_limit"]:
-            return "muscle noise"
         return "blink"
 
 
@@ -202,7 +186,7 @@ def eeg_detect_thread(inlet):
     filt = EEGFilter()
 
     print(f"[EEG] Live detection on {model['name']}: trigger {model['amp_thr']:.0f}, "
-          f"shape >= {SHAPE_MIN_CORR}, muscle <= {model['muscle_limit']:.1f}")
+          f"shape >= {SHAPE_MIN_CORR}")
 
     while not stop_eeg.is_set():
         raw, _ = inlet.pull_sample(timeout=0.5)
@@ -224,7 +208,7 @@ def eeg_detect_thread(inlet):
 
 def drain_chunk(inlet, filt=None):
     """Pull all queued samples from the inlet without blocking.
-    Returns np.array [N, 5+], or filtered [N, 8] if an EEGFilter is given."""
+    Returns np.array [N, 5+], or filtered [N, 4] if an EEGFilter is given."""
     samples, _ = inlet.pull_chunk(timeout=0.0, max_samples=1024)
     if samples:
         return filt(samples) if filt else np.array(samples)
@@ -255,11 +239,10 @@ def blink_strength(epoch_arr, floors):
 
 def compute_calibration(baseline_arr, move_epochs):
     """
-    Learn the user's blink from the relaxed baseline + calibration blinks (all filtered [N, 8]):
+    Learn the user's blink from the relaxed baseline + calibration blinks (all filtered [N, 4]):
       - which forehead sensor sees it best, and which direction it spikes
       - trigger level: THRESH_POS of the way from still-noise to the weakest blink
       - shape template: the average blink, centred on its peak
-      - muscle limit: how much jaw-muscle noise a real blink comes with
 
     Returns a model dict, or None if no usable blink was found.
     """
@@ -281,7 +264,7 @@ def compute_calibration(baseline_arr, move_epochs):
         return None
 
     idx, sign = model["idx"], model["sign"]
-    shapes, blink_muscle = [], []
+    shapes = []
     for ep in move_epochs:
         s = sign * ep[:, idx]
         p = int(np.argmax(s))
@@ -289,15 +272,9 @@ def compute_calibration(baseline_arr, move_epochs):
             continue
         w = s[p - SHAPE_PRE:p + SHAPE_POST]
         shapes.append((w - w.mean()) / (w.std() + 1e-9))
-        blink_muscle.append(max(rms(ep[p - SHAPE_PRE:p + SHAPE_POST, MUSCLE + c]) for c in JAW_MUSCLE))
     if not shapes:
         return None
     model["template"] = np.mean(shapes, axis=0)
-
-    win = SHAPE_PRE + SHAPE_POST
-    still_muscle = [max(rms(baseline_arr[i:i + win, MUSCLE + c]) for c in JAW_MUSCLE)
-                    for i in range(0, len(baseline_arr) - win, SHAPE_POST)] or [0.0]
-    model["muscle_limit"] = max(3.0 * float(np.median(still_muscle)), 1.5 * float(np.max(blink_muscle)))
     return model
 
 
@@ -609,7 +586,7 @@ def run_calibration(screen, clock, fonts, inlet):
 
     def collect_blinks(floors):
         """Wait for the user to blink CALIB_NUM_MOVES times. Returns epochs, or None on restart."""
-        recent  = np.zeros((0, 8))
+        recent  = np.zeros((0, 4))
         keep_n  = int(2 * SRATE)                  # rolling 2 s of signal
         look_n  = int(0.3 * SRATE)                # "is there a blink right now?" window
         epochs  = []
@@ -661,7 +638,7 @@ def run_calibration(screen, clock, fonts, inlet):
             calib_screen_baseline(screen, fonts, time.time() - start)
             pygame.display.flip()
             clock.tick(FPS)
-        baseline_arr = np.vstack(baseline_samples) if baseline_samples else np.zeros((0, 8))
+        baseline_arr = np.vstack(baseline_samples) if baseline_samples else np.zeros((0, 4))
         floors = noise_floors(baseline_arr)
 
         # ── Phase 2: blinks, whenever the user is ready ──
@@ -674,8 +651,7 @@ def run_calibration(screen, clock, fonts, inlet):
         if model is None:
             print("[CALIB] Couldn't learn a blink from the forehead sensors — redoing.")
             continue
-        print(f"[CALIB] {model['name']}: blink {model['snr']:.1f}x noise, trigger {model['amp_thr']:.0f}, "
-              f"muscle limit {model['muscle_limit']:.1f}")
+        print(f"[CALIB] {model['name']}: blink {model['snr']:.1f}x noise, trigger {model['amp_thr']:.0f}")
 
         if wait_for_space(lambda: calib_screen_results(screen, fonts, model)):
             return model
