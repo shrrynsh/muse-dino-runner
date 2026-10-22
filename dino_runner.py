@@ -3,13 +3,13 @@ DINO RUNNER — the Chrome dinosaur game, controlled by BLINKING
 ==============================================================
 The Muse is great at telling "moving" from "still", but bad at telling WHICH
 movement it was. So this game needs exactly one input: blink = jump.
-Blink FIRMLY — the threshold sits above your normal, unconscious blinks.
+A normal, clear blink is enough — calibration learns what YOUR blink looks like.
 
   1. Run `muselsl stream` in a terminal first.
   2. Run this script.
   3. Calibration:
-       a. Stay STILL for 5 seconds (baseline noise)
-       b. BLINK firmly 6 times when prompted
+       a. Relax for a few seconds (baseline noise)
+       b. Blink 6 times, whenever you like — each one is detected live
      The script picks the 2 channels that see YOUR blinks best and sets thresholds.
   4. Play. Blink to jump over cactuses.
      Watch out for HIGH birds — don't blink, run under them!
@@ -41,14 +41,14 @@ REARM_FRAC      = 0.6                 # activity must fall below thr*this before
 REARM_TIMEOUT   = 2.0                 # ...or re-arm anyway after this long (one blink = one jump)
 
 # Calibration parameters
-CALIB_BASELINE_SEC = 5.0
+CALIB_BASELINE_SEC = 4.0
 CALIB_NUM_MOVES    = 6
-CALIB_PRE_CUE_SEC  = 1.2
-CALIB_CAPTURE_SEC  = 1.2
-CALIB_REST_SEC     = 0.6
-CALIB_RESULT_SEC   = 0.9     # how long "GOT IT" / "MISSED" stays on screen
-BLINK_MIN_RATIO    = 6.0     # a cued blink only counts if it's this many times above the still-noise
-CALIB_MAX_TRIES    = 15      # give up asking for more blinks after this many cues
+BLINK_MIN_RATIO    = 3.5     # a calibration blink counts once it's this many times above the still-noise
+BLINK_TAIL_SEC     = 0.5     # keep recording this long after a blink starts, to catch all of it
+BLINK_EPOCH_SEC    = 1.0     # how much signal to keep per calibration blink
+CALIB_GOT_IT_SEC   = 0.6     # how long the "got it" flash stays on screen
+CALIB_HINT_SEC     = 10.0    # show fit tips if no blink is seen for this long
+THRESH_POS         = 0.4     # game trigger sits this far from still-noise (0) to your weakest blink (1)
 
 # ─── GAME CONFIG ─────────────────────────────────────────────────────────────
 WIDTH, HEIGHT   = 960, 400
@@ -154,7 +154,9 @@ def noise_floors(baseline_arr):
     for idx, _ in EEG_CHANNELS:
         act = window_activity(baseline_arr[:, idx])
         if len(act):
-            floors[idx] = float(np.percentile(act, 99))   # ignore a single stray blip
+            # 99th percentile ignores a stray blip; the 3x-median cap stops an
+            # accidental blink during the "relax" step from inflating the floor
+            floors[idx] = float(min(np.percentile(act, 99), 3 * np.median(act)))
     return floors
 
 
@@ -171,8 +173,8 @@ def blink_strength(epoch_arr, floors):
 def compute_calibration(baseline_arr, move_epochs):
     """
     For each channel, compare the activity while still with the peak activity of each
-    cued movement. Pick channels where the weakest move clearly beats the noise.
-    Threshold = midway between them.
+    calibration blink. Pick channels where the weakest blink clearly beats the noise.
+    Threshold = THRESH_POS of the way from the noise up to the weakest blink.
 
     Returns: (top_channels [(idx, name, thr)], full_results [(name, snr, thr)])
     """
@@ -195,7 +197,7 @@ def compute_calibration(baseline_arr, move_epochs):
 
         snr = median_move / max(noise_floor, 1e-3)
         if weakest_move > noise_floor:
-            thr = (noise_floor + weakest_move) / 2.0
+            thr = noise_floor + THRESH_POS * (weakest_move - noise_floor)
         else:
             thr = noise_floor * 1.3       # moves barely beat noise — stay just above it
         full.append((idx, name, snr, thr))
@@ -395,59 +397,26 @@ def draw_hud_play(surf, fonts, score, high):
 
 # ─── CALIBRATION SCREENS ────────────────────────────────────────────────────
 
-def draw_progress_bar(surf, x, y, w, h, frac, col):
-    pygame.draw.rect(surf, (70, 70, 80), (x, y, w, h), border_radius=4)
-    pygame.draw.rect(surf, col, (x, y, int(w * min(1.0, frac)), h), border_radius=4)
-
-
 def calib_screen_intro(screen, fonts):
     screen.fill(DARK_BG)
-    draw_centered(screen, fonts['big'], "DINO RUNNER", 60, UI_WHITE)
-    draw_centered(screen, fonts['med'], "Quick calibration (~20 s)", 130, UI_WHITE)
-    draw_centered(screen, fonts['small'], f"Step 1: stay completely still for {int(CALIB_BASELINE_SEC)} s", 185, (150, 200, 255))
-    draw_centered(screen, fonts['small'], f"Step 2: blink FIRMLY {CALIB_NUM_MOVES} times on the green cue", 215, (150, 200, 255))
-    draw_centered(screen, fonts['small'], "(a strong, deliberate blink — the same way you will blink in the game)", 245, (140, 140, 150))
-    draw_centered(screen, fonts['big'], "Press SPACE", 310, (110, 230, 140))
+    draw_centered(screen, fonts['big'], "DINO RUNNER", 50, UI_WHITE)
+    draw_centered(screen, fonts['med'], "Let's learn what your blink looks like", 120, UI_WHITE)
+    draw_centered(screen, fonts['small'], "1.  Relax for a few seconds, eyes open", 180, (150, 200, 255))
+    draw_centered(screen, fonts['small'], f"2.  Blink {CALIB_NUM_MOVES} times, whenever you like — a normal, clear blink", 210, (150, 200, 255))
+    draw_centered(screen, fonts['big'], "Press SPACE to start", 290, (110, 230, 140))
 
 
-def calib_screen_baseline(screen, fonts, frac):
+def calib_screen_baseline(screen, fonts, t):
     screen.fill(DARK_BG)
-    draw_centered(screen, fonts['big'], "STAY STILL", 100, (255, 200, 100))
-    draw_centered(screen, fonts['med'], "eyes open, try not to blink", 170, UI_WHITE)
-    draw_progress_bar(screen, WIDTH // 2 - 200, 250, 400, 20, frac, (255, 200, 100))
+    draw_centered(screen, fonts['big'], "Relax", 70, (255, 200, 100))
+    draw_centered(screen, fonts['small'], "look at the dot, eyes open, try not to blink", 125, UI_WHITE)
+    # Gently breathing dot — something calm to look at
+    r = int(26 + 8 * np.sin(t * 2.5))
+    pygame.draw.circle(screen, (255, 200, 100), (WIDTH // 2, HEIGHT // 2 + 40), r)
 
 
-def calib_screen_move(screen, fonts, move_num, phase, phase_frac, level=0.0):
-    """
-    phase: 'ready' (amber), 'cue' (green BLINK!), 'capture' (blue), 'hit' (green GOT IT),
-           'miss' (red MISSED), 'rest' (gray)
-    level: strongest blink seen so far this cue, as a multiple of still-noise
-    """
-    screen.fill(DARK_BG)
-    draw_centered(screen, fonts['med'], f"Blink  {move_num} / {CALIB_NUM_MOVES}", 20, UI_WHITE)
-
-    cx, cy = WIDTH // 2, HEIGHT // 2 - 20
-    if phase == 'ready':
-        col, msg, radius = (255, 200, 100), "get ready", 70 + int(15 * phase_frac)
-    elif phase == 'cue':
-        col, msg, radius = (110, 230, 140), "BLINK!", 110
-    elif phase == 'capture':
-        col, msg, radius = (100, 180, 255), "…", 90
-    elif phase == 'hit':
-        col, msg, radius = (110, 230, 140), "GOT IT", 100
-    elif phase == 'miss':
-        col, msg, radius = UI_RED, "MISSED", 100
-    else:
-        col, msg, radius = (90, 90, 110), "wait…", 70
-
-    pygame.draw.circle(screen, col, (cx, cy), radius)
-    pygame.draw.circle(screen, DARK_BG, (cx, cy), radius - 12)
-    draw_centered(screen, fonts['big'], msg, cy - 24, col)
-    if phase == 'miss':
-        draw_centered(screen, fonts['small'], "no blink seen — blink harder, let's redo this one",
-                      cy + radius + 8, UI_RED)
-
-    # Live meter: how strong the blink was; it has to pass the white line to count
+def draw_blink_meter(screen, fonts, level):
+    """Live signal bar; a blink counts when it crosses the white line."""
     bw, bh = 400, 14
     bx, by = WIDTH // 2 - bw // 2, HEIGHT - 40
     scale = BLINK_MIN_RATIO * 2
@@ -455,36 +424,62 @@ def calib_screen_move(screen, fonts, move_num, phase, phase_frac, level=0.0):
     pygame.draw.rect(screen, (70, 70, 80), (bx, by, bw, bh), border_radius=4)
     pygame.draw.rect(screen, fill_col, (bx, by, int(bw * min(1.0, level / scale)), bh), border_radius=4)
     pygame.draw.line(screen, UI_WHITE, (bx + bw // 2, by - 4), (bx + bw // 2, by + bh + 4), 2)
-    screen.blit(fonts['tiny'].render(f"blink signal {level:4.1f}x", True, (140, 140, 150)), (bx, by - 18))
+    screen.blit(fonts['tiny'].render("your signal", True, (140, 140, 150)), (bx, by - 18))
 
 
-def calib_screen_no_blinks(screen, fonts):
+def calib_screen_blinks(screen, fonts, count, flash, level, show_hint):
+    """
+    count: blinks captured so far   flash: 0..1, how fresh the last "got it" is
+    """
     screen.fill(DARK_BG)
-    draw_centered(screen, fonts['big'], "NO BLINKS DETECTED", 60, UI_RED)
-    draw_centered(screen, fonts['small'], "The headband isn't picking up your blinks. Try:", 140, UI_WHITE)
-    draw_centered(screen, fonts['small'], "• press the forehead sensors flat against your skin", 180, (150, 200, 255))
-    draw_centered(screen, fonts['small'], "• move hair away from behind your ears, dampen the sensors", 210, (150, 200, 255))
-    draw_centered(screen, fonts['small'], "• stay really still during the 'STAY STILL' step", 240, (150, 200, 255))
-    draw_centered(screen, fonts['med'], "SPACE = try again", HEIGHT - 60, (110, 230, 140))
+
+    # Progress: one dot per blink, filled when captured
+    gap = 46
+    x0 = WIDTH // 2 - gap * (CALIB_NUM_MOVES - 1) // 2
+    for i in range(CALIB_NUM_MOVES):
+        pos = (x0 + i * gap, 50)
+        if i < count:
+            pygame.draw.circle(screen, (110, 230, 140), pos, 14)
+        else:
+            pygame.draw.circle(screen, (90, 90, 110), pos, 14, 3)
+
+    cy = HEIGHT // 2 - 10
+    if flash > 0:
+        pygame.draw.circle(screen, (110, 230, 140), (WIDTH // 2, cy), int(105 + 25 * flash), 6)
+        draw_centered(screen, fonts['big'], "got it!", cy - 24, (110, 230, 140))
+    else:
+        draw_centered(screen, fonts['big'], "Blink", cy - 40, UI_WHITE)
+        left = CALIB_NUM_MOVES - count
+        draw_centered(screen, fonts['small'], f"{left} more — take your time", cy + 14, (140, 140, 150))
+
+    if show_hint:
+        draw_centered(screen, fonts['small'], "Not picking it up? Press the forehead sensors flat on your skin,",
+                      HEIGHT - 110, (255, 200, 100))
+        draw_centered(screen, fonts['small'], "or blink a little more clearly.   C = start over",
+                      HEIGHT - 86, (255, 200, 100))
+
+    draw_blink_meter(screen, fonts, level)
 
 
 def calib_screen_results(screen, fonts, top_chans, all_chans):
     screen.fill(DARK_BG)
-    draw_centered(screen, fonts['big'], "CALIBRATED", 20, (110, 230, 140))
-    draw_centered(screen, fonts['small'], "How much louder your move is than staying still (SNR):", 85, (150, 200, 255))
-
-    y = 120
-    for name, snr, thr in all_chans:
-        col = (110, 230, 140) if any(name == n for _, n, _ in top_chans) else (140, 140, 160)
-        draw_centered(screen, fonts['med'], f"{name:<5}  SNR {snr:5.1f}x   thr {thr:5.0f} µV", y, col)
-        y += 36
-
     best = all_chans[0][1] if all_chans else 0
-    if best < 2.0:
-        draw_centered(screen, fonts['small'], "Weak signal — press C to redo, or adjust the headband fit.", y + 10, UI_RED)
+    if best >= 5:
+        verdict, col = "Great signal", (110, 230, 140)
+    elif best >= 2:
+        verdict, col = "Good enough", (255, 200, 100)
     else:
-        draw_centered(screen, fonts['small'], "Green channels will make the dino jump.", y + 10, (255, 200, 100))
-    draw_centered(screen, fonts['med'], "SPACE = play     C = redo", HEIGHT - 50, (110, 230, 140))
+        verdict, col = "Weak signal — jumps may be unreliable", UI_RED
+
+    draw_centered(screen, fonts['big'], "ALL SET!", 60, (110, 230, 140))
+    draw_centered(screen, fonts['med'], verdict, 130, col)
+    draw_centered(screen, fonts['small'],
+                  f"your blink is {best:.1f}x stronger than when you're relaxed", 170, (150, 200, 255))
+    names = " + ".join(n for _, n, _ in top_chans)
+    draw_centered(screen, fonts['tiny'], f"using sensors {names}", 200, (140, 140, 150))
+    if best < 2:
+        draw_centered(screen, fonts['small'], "Adjust the headband fit and press C to redo.", 240, UI_RED)
+    draw_centered(screen, fonts['med'], "SPACE = play     C = redo", HEIGHT - 70, (110, 230, 140))
 
 
 # ─── CALIBRATION RUNNER ─────────────────────────────────────────────────────
@@ -492,12 +487,17 @@ def calib_screen_results(screen, fonts, top_chans, all_chans):
 def run_calibration(screen, clock, fonts, inlet):
     """Returns (top_channels, all_channels_report)."""
 
-    def handle_quit():
+    def handle_keys():
+        """Quit on Q/ESC. Returns True if C (start over) was pressed."""
+        restart = False
         for event in pygame.event.get():
             if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN
                                              and event.key in (pygame.K_q, pygame.K_ESCAPE)):
                 pygame.quit()
                 sys.exit()
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_c:
+                restart = True
+        return restart
 
     def wait_for_space(draw):
         """Show a screen until SPACE (returns True) or C (returns False)."""
@@ -515,59 +515,66 @@ def run_calibration(screen, clock, fonts, inlet):
             pygame.display.flip()
             clock.tick(FPS)
 
-    def timed_phase(secs, draw, keep=None):
-        """Run a screen for `secs` seconds, optionally collecting samples into `keep`."""
-        start = time.time()
-        while time.time() - start < secs:
-            handle_quit()
+    def collect_blinks(floors):
+        """Wait for the user to blink CALIB_NUM_MOVES times. Returns epochs, or None on restart."""
+        recent  = np.zeros((0, 5))
+        keep_n  = int(2 * SRATE)                  # rolling 2 s of signal
+        look_n  = int(0.3 * SRATE)                # "is there a blink right now?" window
+        epochs  = []
+        seen_at = None                            # when the current blink started
+        armed   = True                            # wait for the signal to settle between blinks
+        flash_until = 0.0
+        last_progress = time.time()
+
+        while len(epochs) < CALIB_NUM_MOVES or time.time() < flash_until:
+            if handle_keys():
+                return None
             chunk = drain_chunk(inlet)
-            if keep is not None and chunk is not None:
-                keep.append(chunk)
-            draw((time.time() - start) / secs)
+            if chunk is not None:
+                recent = np.vstack([recent, chunk[:, :5]])[-keep_n:]
+            level = blink_strength(recent[-look_n:], floors) if len(recent) >= look_n else 0.0
+            now = time.time()
+
+            if len(epochs) < CALIB_NUM_MOVES:
+                if seen_at is None and armed and level >= BLINK_MIN_RATIO:
+                    seen_at = now
+                elif seen_at is not None and now - seen_at >= BLINK_TAIL_SEC:
+                    epochs.append(recent[-int(BLINK_EPOCH_SEC * SRATE):].copy())
+                    print(f"[CALIB] blink {len(epochs)}: {blink_strength(epochs[-1], floors):.1f}x")
+                    seen_at, armed = None, False
+                    flash_until = now + CALIB_GOT_IT_SEC
+                    last_progress = now
+                elif not armed and seen_at is None and level < BLINK_MIN_RATIO * 0.5:
+                    armed = True
+
+            flash = max(0.0, (flash_until - now) / CALIB_GOT_IT_SEC)
+            show_hint = now - last_progress > CALIB_HINT_SEC
+            calib_screen_blinks(screen, fonts, len(epochs), flash, level, show_hint)
             pygame.display.flip()
             clock.tick(FPS)
+        return epochs
 
     while True:
         wait_for_space(lambda: calib_screen_intro(screen, fonts))
 
-        # ── Phase 1: baseline ──
+        # ── Phase 1: a few relaxed seconds, to measure the noise floor ──
         drain_chunk(inlet)
         baseline_samples = []
-        timed_phase(CALIB_BASELINE_SEC,
-                    lambda f: calib_screen_baseline(screen, fonts, f), baseline_samples)
+        start = time.time()
+        while time.time() - start < CALIB_BASELINE_SEC:
+            handle_keys()
+            chunk = drain_chunk(inlet)
+            if chunk is not None:
+                baseline_samples.append(chunk)
+            calib_screen_baseline(screen, fonts, time.time() - start)
+            pygame.display.flip()
+            clock.tick(FPS)
         baseline_arr = np.vstack(baseline_samples) if baseline_samples else np.zeros((0, 5))
-
         floors = noise_floors(baseline_arr)
 
-        # ── Phase 2: cued blinks — only real blinks count, missed ones are redone ──
-        move_epochs = []
-        tries = 0
-        while len(move_epochs) < CALIB_NUM_MOVES and tries < CALIB_MAX_TRIES:
-            tries += 1
-            n = len(move_epochs) + 1
-            timed_phase(CALIB_PRE_CUE_SEC, lambda f: calib_screen_move(screen, fonts, n, 'ready', f))
-            drain_chunk(inlet)   # clear backlog right before cue
-            epoch = []
-
-            def live_level():
-                return blink_strength(np.vstack(epoch), floors) if epoch else 0.0
-
-            timed_phase(0.35, lambda f: calib_screen_move(screen, fonts, n, 'cue', f, live_level()), epoch)
-            timed_phase(CALIB_CAPTURE_SEC - 0.35,
-                        lambda f: calib_screen_move(screen, fonts, n, 'capture', f, live_level()), epoch)
-
-            level = live_level()
-            got_it = level >= BLINK_MIN_RATIO
-            print(f"[CALIB] cue {tries}: blink signal {level:.1f}x -> {'GOT IT' if got_it else 'MISSED'}")
-            if got_it:
-                move_epochs.append(np.vstack(epoch))
-            timed_phase(CALIB_RESULT_SEC,
-                        lambda f: calib_screen_move(screen, fonts, n, 'hit' if got_it else 'miss', f, level))
-            timed_phase(CALIB_REST_SEC, lambda f: calib_screen_move(screen, fonts, n, 'rest', f))
-
-        if not move_epochs:
-            print("[CALIB] No blinks detected — check the headband fit.")
-            wait_for_space(lambda: calib_screen_no_blinks(screen, fonts))
+        # ── Phase 2: blinks, whenever the user is ready ──
+        move_epochs = collect_blinks(floors)
+        if move_epochs is None:
             continue
 
         # ── Compute & show results ──
